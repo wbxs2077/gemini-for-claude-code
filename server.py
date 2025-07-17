@@ -4,6 +4,8 @@ import logging
 import json
 import re
 import asyncio
+from itertools import cycle
+
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional, Union, Literal, Set
 import os
@@ -53,10 +55,27 @@ class Constants:
     DELTA_TEXT = "text_delta"
     DELTA_INPUT_JSON = "input_json_delta"
 
+class ApiKeyManager:
+    def __init__(self):
+        self.keys = [key.strip() for key in os.environ.get("GEMINI_API_KEY", "").split(',') if key.strip()]
+        if not self.keys:
+            self.keys = [os.environ.get("GEMINI_API_KEY")]
+        
+        self.key_iterator = cycle(self.keys)
+        self.lock = asyncio.Lock()
+
+    async def get_next_key(self):
+        async with self.lock:
+            return next(self.key_iterator)
+
+    def get_initial_key(self):
+        return self.keys[0] if self.keys else None
+
 # Simple Configuration
 class Config:
     def __init__(self):
-        self.gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        self.api_key_manager = ApiKeyManager()
+        self.gemini_api_key = self.api_key_manager.get_initial_key()
         if not self.gemini_api_key:
             raise ValueError("GEMINI_API_KEY not found in environment variables")
         
@@ -1053,7 +1072,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
 
         # Convert request
         litellm_request = convert_anthropic_to_litellm(request)
-        litellm_request["api_key"] = config.gemini_api_key
+        litellm_request["api_key"] = await config.api_key_manager.get_next_key()
         
         # Log request details
         num_tools = len(request.tools) if request.tools else 0
@@ -1240,7 +1259,7 @@ async def test_connection():
             model="gemini/gemini-1.5-flash-latest",
             messages=[{"role": "user", "content": "Hello"}],
             max_tokens=5,
-            api_key=config.gemini_api_key
+            api_key= await config.api_key_manager.get_next_key()
         )
         
         return {

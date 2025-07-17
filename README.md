@@ -64,8 +64,8 @@ This server acts as a bridge, enabling you to use **Claude Code** with Google's 
     ```
     Edit `.env` and add your Gemini API key. You can also customize model mappings and server settings:
     ```dotenv
-    # Required: Your Google AI Studio API key
-    GEMINI_API_KEY="your-google-ai-studio-key"
+    # Required: Your Google AI Studio API key. You can provide multiple keys separated by commas for key rotation.
+    GEMINI_API_KEY="your-google-ai-studio-key-1,your-google-ai-studio-key-2"
 
     # Optional: Model mappings for Claude Code aliases
     BIG_MODEL="gemini-1.5-pro-latest"    # For 'sonnet' or 'opus' requests
