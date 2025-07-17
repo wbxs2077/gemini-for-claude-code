@@ -55,21 +55,93 @@ class Constants:
     DELTA_TEXT = "text_delta"
     DELTA_INPUT_JSON = "input_json_delta"
 
-class ApiKeyManager:
-    def __init__(self):
-        self.keys = [key.strip() for key in os.environ.get("GEMINI_API_KEY", "").split(',') if key.strip()]
-        if not self.keys:
-            self.keys = [os.environ.get("GEMINI_API_KEY")]
-        
-        self.key_iterator = cycle(self.keys)
-        self.lock = asyncio.Lock()
+from datetime import datetime, timedelta
 
-    async def get_next_key(self):
+class ApiKeyManager:
+    """
+    Manages the lifecycle of API keys, including rotation, temporary deactivation, 
+    and permanent removal to handle rate limits and invalid keys gracefully.
+    """
+    def __init__(self):
+        self.initial_keys: Set[str] = {key.strip() for key in os.environ.get("GEMINI_API_KEY", "").split(',') if key.strip()}
+        if not self.initial_keys:
+            # Fallback for single, potentially empty key
+            single_key = os.environ.get("GEMINI_API_KEY")
+            if single_key:
+                self.initial_keys = {single_key.strip()}
+
+        self.available_keys: List[str] = sorted(list(self.initial_keys))
+        self.temporarily_disabled_keys: Dict[str, datetime] = {}
+        self.permanently_disabled_keys: Set[str] = set()
+        
+        self.key_iterator = cycle(self.available_keys) if self.available_keys else cycle([])
+        self.lock = asyncio.Lock()
+        
+        if not self.available_keys:
+            logger.error("🚨 No valid GEMINI_API_KEY found in environment variables. The application will not function.")
+
+    def _rebuild_iterator(self):
+        """Rebuilds the key iterator from the current available keys."""
+        self.available_keys = sorted([k for k in self.available_keys if k not in self.permanently_disabled_keys and k not in self.temporarily_disabled_keys])
+        self.key_iterator = cycle(self.available_keys) if self.available_keys else cycle([])
+        logger.debug(f"Iterator rebuilt. Available keys: {len(self.available_keys)}")
+
+    async def _reactivate_keys(self):
+        """Checks for and reactivates keys from the temporary disabled list if their cooldown has passed."""
+        now = datetime.now()
+        reactivated_keys = [
+            key for key, expiry in self.temporarily_disabled_keys.items()
+            if now > expiry
+        ]
+        
+        if reactivated_keys:
+            async with self.lock:
+                for key in reactivated_keys:
+                    del self.temporarily_disabled_keys[key]
+                    if key not in self.permanently_disabled_keys:
+                        self.available_keys.append(key)
+                
+                if reactivated_keys:
+                    self._rebuild_iterator()
+                    logger.info(f"🔑 Reactivated {len(reactivated_keys)} API keys: {reactivated_keys}")
+
+    async def get_next_key(self) -> Optional[str]:
+        """Gets the next available key, after reactivating any expired ones."""
+        await self._reactivate_keys()
         async with self.lock:
+            if not self.available_keys:
+                logger.warning("No available API keys to use.")
+                return None
             return next(self.key_iterator)
 
-    def get_initial_key(self):
-        return self.keys[0] if self.keys else None
+    async def deactivate_temporarily(self, key: str):
+        """Temporarily disables a key using the configured cooldown period."""
+        if key in self.permanently_disabled_keys:
+            return
+            
+        cooldown_minutes = config.key_cooldown_minutes
+        async with self.lock:
+            if key in self.available_keys:
+                self.available_keys.remove(key)
+                self.temporarily_disabled_keys[key] = datetime.now() + timedelta(minutes=cooldown_minutes)
+                self._rebuild_iterator()
+                logger.warning(f"🔑 Temporarily deactivated API key ending in '...{key[-4:]}' for {cooldown_minutes} minutes.")
+
+    async def deactivate_permanently(self, key: str):
+        """Permanently disables a key."""
+        async with self.lock:
+            if key in self.available_keys:
+                self.available_keys.remove(key)
+            if key in self.temporarily_disabled_keys:
+                del self.temporarily_disabled_keys[key]
+                
+            self.permanently_disabled_keys.add(key)
+            self._rebuild_iterator()
+            logger.error(f"🔑 Permanently disabled API key ending in '...{key[-4:]}'.")
+
+    def get_initial_key(self) -> Optional[str]:
+        """Returns one of the initial keys, useful for startup checks."""
+        return next(iter(self.initial_keys), None)
 
 # Simple Configuration
 class Config:
@@ -89,6 +161,7 @@ class Config:
         # Connection settings - conservative defaults
         self.request_timeout = int(os.environ.get("REQUEST_TIMEOUT", "90"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "2"))
+        self.key_cooldown_minutes = int(os.environ.get("KEY_COOLDOWN_MINUTES", "1440")) # Default 24 hours
         
         # Streaming settings
         self.max_streaming_retries = int(os.environ.get("MAX_STREAMING_RETRIES", "12"))
@@ -721,7 +794,7 @@ def convert_litellm_to_anthropic(litellm_response, original_request: MessagesReq
         )
 
 # Enhanced streaming handler with more robust error recovery
-async def handle_streaming_with_recovery(response_generator, original_request: MessagesRequest, input_tokens: int):
+async def handle_streaming_with_recovery(response_generator, original_request: MessagesRequest, input_tokens: int, api_key: str):
     """Enhanced streaming handler with robust error recovery for malformed chunks."""
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     
@@ -976,13 +1049,28 @@ async def handle_streaming_with_recovery(response_generator, original_request: M
                     break
                 continue
                 
+            except litellm.exceptions.AuthenticationError as auth_error:
+                logger.error(f"AuthenticationError during streaming with key '...{api_key[-4:]}'. Deactivating permanently.")
+                await config.api_key_manager.deactivate_permanently(api_key)
+                error_text = "\n\n⚠️ API Key Authentication Error. This key has been disabled. Please retry your request to use a new key."
+                yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': error_text}})}\n\n"
+                stream_terminated_early = True
+                break
+
+            except litellm.exceptions.RateLimitError as rate_limit_error:
+                logger.warning(f"RateLimitError during streaming with key '...{api_key[-4:]}'. Deactivating temporarily.")
+                await config.api_key_manager.deactivate_temporarily(api_key)
+                error_text = "\n\n⚠️ API Key Rate Limit Exceeded. This key has been temporarily disabled. Please retry your request to use a new key."
+                yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': error_text}})}\n\n"
+                stream_terminated_early = True
+                break
+
             except (litellm.exceptions.APIConnectionError, RuntimeError) as api_error:
                 consecutive_errors += 1
                 error_msg = str(api_error)
                 
-                # Check for the specific malformed chunk error
-                if ("Error parsing chunk" in error_msg and 
-                    "Expecting property name enclosed in double quotes" in error_msg):
+                # Check for the specific malformed chunk error, now more general
+                if "Error parsing chunk" in error_msg:
                     
                     logger.warning(f"Gemini malformed chunk error (attempt {consecutive_errors}/{max_consecutive_errors})")
                     
@@ -1055,120 +1143,120 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# Enhanced streaming retry logic for the main endpoint
+# ##############################################################################
+# Request Handling Logic
+# ##############################################################################
+
+async def _handle_non_streaming_request(request: MessagesRequest, litellm_request: Dict[str, Any]):
+    """Handles non-streaming requests with full key rotation and retry logic."""
+    total_keys = len(config.api_key_manager.initial_keys)
+    last_exception = None
+
+    for attempt in range(total_keys):
+        current_key = await config.api_key_manager.get_next_key()
+        if not current_key:
+            logger.error("All API keys disabled, cannot process non-streaming request.")
+            break
+
+        litellm_request["api_key"] = current_key
+        logger.info(f"Non-streaming attempt {attempt + 1}/{total_keys} using key '...{current_key[-4:]}'")
+
+        try:
+            start_time = time.time()
+            litellm_response = await litellm.acompletion(**litellm_request)
+            logger.info(f"✅ Response received in {time.time() - start_time:.2f}s")
+            
+            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+            return anthropic_response
+
+        except litellm.exceptions.AuthenticationError as e:
+            logger.error(f"AuthenticationError with key '...{current_key[-4:]}'. Deactivating permanently.")
+            await config.api_key_manager.deactivate_permanently(current_key)
+            last_exception = e
+            continue
+
+        except litellm.exceptions.RateLimitError as e:
+            logger.warning(f"RateLimitError with key '...{current_key[-4:]}'. Deactivating temporarily.")
+            await config.api_key_manager.deactivate_temporarily(current_key)
+            last_exception = e
+            continue
+
+        except (litellm.exceptions.APIConnectionError, RuntimeError) as e:
+            logger.warning(f"APIConnectionError/RuntimeError on non-streaming: {e}")
+            last_exception = e
+            # For non-streaming, we can also try the next key for these errors
+            continue
+
+    # If loop completes, all keys failed.
+    logger.error("All available API keys were tried and failed for non-streaming request.")
+    if last_exception:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: All API keys failed. Last error: {classify_gemini_error(str(last_exception))}")
+    else:
+        raise HTTPException(status_code=503, detail="Service unavailable: Could not process the request with any available API keys.")
+
+
+async def _handle_streaming_request(request: MessagesRequest, litellm_request: Dict[str, Any]):
+    """Handles streaming requests, including key selection and error handling wrapper."""
+    current_key = await config.api_key_manager.get_next_key()
+    if not current_key:
+        raise HTTPException(status_code=503, detail="Service unavailable: No API keys available for streaming.")
+    
+    litellm_request["api_key"] = current_key
+    logger.info(f"Streaming request using key '...{current_key[-4:]}'")
+
+    try:
+        input_tokens = litellm.token_counter(model=litellm_request["model"], messages=litellm_request["messages"])
+    except Exception:
+        input_tokens = 0
+
+    try:
+        response_generator = await litellm.acompletion(**litellm_request)
+    except (litellm.exceptions.AuthenticationError, litellm.exceptions.RateLimitError) as e:
+        # These errors can happen before the stream starts. We need to handle them here too.
+        if isinstance(e, litellm.exceptions.AuthenticationError):
+            logger.error(f"AuthenticationError on initial streaming call for key '...{current_key[-4:]}'. Deactivating permanently.")
+            await config.api_key_manager.deactivate_permanently(current_key)
+        elif isinstance(e, litellm.exceptions.RateLimitError):
+            logger.warning(f"RateLimitError on initial streaming call for key '...{current_key[-4:]}'. Deactivating temporarily.")
+            await config.api_key_manager.deactivate_temporarily(current_key)
+        
+        error_detail = classify_gemini_error(str(e))
+        # Provide a clear error to the client, prompting a retry which will use a new key.
+        raise HTTPException(status_code=503, detail=f"API key error: {error_detail}. Please retry your request.")
+
+    return StreamingResponse(
+        handle_streaming_with_recovery(response_generator, request, input_tokens, current_key),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
+    )
+
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
     try:
         logger.debug(f"📊 Processing request: Original={request.original_model}, Effective={request.model}, Stream={request.stream}")
 
-        # Check streaming configuration
-        if request.stream and config.emergency_disable_streaming:
-            logger.warning("Streaming disabled via EMERGENCY_DISABLE_STREAMING")
+        # Disable streaming if configured
+        if request.stream and (config.emergency_disable_streaming or config.force_disable_streaming):
+            logger.warning("Streaming is administratively disabled. Processing as non-streaming.")
             request.stream = False
 
-        if request.stream and config.force_disable_streaming:
-            logger.info("Streaming disabled via FORCE_DISABLE_STREAMING")
-            request.stream = False
-
-        # Convert request
+        # Convert request to LiteLLM format once
         litellm_request = convert_anthropic_to_litellm(request)
-        litellm_request["api_key"] = await config.api_key_manager.get_next_key()
         
-        # Log request details
-        num_tools = len(request.tools) if request.tools else 0
+        # Log the request beautifully
         log_request_beautifully(
             "POST", raw_request.url.path,
             request.original_model or request.model,
             litellm_request.get('model'),
             len(litellm_request['messages']),
-            num_tools, 200
+            len(request.tools or []), 200 # Assume 200 for now
         )
 
-        # Enhanced streaming with better retry logic
+        # Delegate to the appropriate handler
         if request.stream:
-            # Pre-calculate input tokens as they are not available in the stream.
-            # We use litellm.token_counter as it's the only way to get a non-zero, close-to-accurate count of input tokens for streaming calls.
-            # While tokenizer drift is a concern, this is a practical trade-off for useful logging and cost estimation.
-            try:
-                input_tokens = litellm.token_counter(
-                    model=litellm_request["model"],
-                    messages=litellm_request["messages"]
-                )
-            except Exception:
-                input_tokens = 0
-
-            streaming_retry_count = 0
-            max_retries = config.max_streaming_retries
-            
-            while streaming_retry_count <= max_retries:
-                try:
-                    logger.debug(f"Attempting streaming (attempt {streaming_retry_count + 1}/{max_retries + 1})")
-                    
-                    # Add slight delay between retries
-                    if streaming_retry_count > 0:
-                        delay = min(0.5 * (2 ** streaming_retry_count), 2.0)  # Exponential backoff, max 2s
-                        logger.debug(f"Waiting {delay}s before retry...")
-                        await asyncio.sleep(delay)
-                    
-                    response_generator = await litellm.acompletion(**litellm_request)
-                    
-                    return StreamingResponse(
-                        handle_streaming_with_recovery(response_generator, request, input_tokens),
-                        media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no",
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Headers": "*"
-                        }
-                    )
-                    
-                except (litellm.exceptions.APIConnectionError, RuntimeError) as streaming_error:
-                    streaming_retry_count += 1
-                    error_msg = str(streaming_error)
-                    
-                    # Check for the specific malformed chunk error
-                    if ("Error parsing chunk" in error_msg and 
-                        "Expecting property name enclosed in double quotes" in error_msg):
-                        
-                        if streaming_retry_count <= max_retries:
-                            logger.warning(f"Gemini streaming chunk parsing error (attempt {streaming_retry_count}/{max_retries + 1}), retrying...")
-                            continue
-                        else:
-                            logger.error(f"Gemini streaming failed after {max_retries + 1} attempts due to malformed chunks, falling back to non-streaming")
-                            break
-                    else:
-                        # Other streaming errors - could be connection issues
-                        if streaming_retry_count <= max_retries:
-                            logger.warning(f"Streaming error (attempt {streaming_retry_count}/{max_retries + 1}): {error_msg}")
-                            continue
-                        else:
-                            logger.error(f"Streaming failed after {max_retries + 1} attempts, falling back to non-streaming")
-                            break
-                            
-                except Exception as unexpected_error:
-                    streaming_retry_count += 1
-                    logger.error(f"Unexpected streaming error (attempt {streaming_retry_count}/{max_retries + 1}): {unexpected_error}")
-                    
-                    if streaming_retry_count <= max_retries:
-                        continue
-                    else:
-                        logger.error(f"Streaming failed after {max_retries + 1} attempts due to unexpected errors, falling back to non-streaming")
-                        break
-            
-            # If we get here, streaming failed - fall back to non-streaming
-            logger.info("Falling back to non-streaming mode")
-            litellm_request["stream"] = False
-        
-        # Non-streaming path (or fallback)
-        if not request.stream or litellm_request.get("stream") == False:
-            start_time = time.time()
-            litellm_response = await litellm.acompletion(**litellm_request)
-            logger.debug(f"✅ Response received: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
-            
-            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
-            return anthropic_response
+            return await _handle_streaming_request(request, litellm_request)
+        else:
+            return await _handle_non_streaming_request(request, litellm_request)
 
     except litellm.exceptions.APIError as e:
         logger.error(f"LiteLLM API Error: {e}")
@@ -1181,9 +1269,14 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         logger.error(f"Timeout Error: {e}")
         raise HTTPException(status_code=504, detail="Request timeout. Please try again.")
     except Exception as e:
-        logger.error(f"Error processing request: {e}")
+        # This will catch unhandled exceptions, including HTTPExceptions from handlers
+        if isinstance(e, HTTPException):
+            # Re-raise HTTPException to let FastAPI handle it
+            raise e
+        logger.error(f"Unexpected error processing request: {e}", exc_info=True)
         error_msg = classify_gemini_error(str(e))
         raise HTTPException(status_code=500, detail=error_msg)
+
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: TokenCountRequest, raw_request: Request):
@@ -1221,6 +1314,34 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         error_msg = classify_gemini_error(str(e))
         raise HTTPException(status_code=500, detail=f"Error counting tokens: {error_msg}")
 
+def mask_key(key: str) -> str:
+    """Masks an API key, showing only the last 4 characters."""
+    return f"...{key[-4:]}" if len(key) > 4 else key
+
+@app.get("/v1/keys/status", summary="Get the real-time status of all API keys")
+async def get_key_status():
+    """
+    Provides a real-time view of the API key pool, categorized by their status.
+    For security, keys are masked, showing only the last 4 characters.
+    """
+    manager = config.api_key_manager
+    async with manager.lock:
+        available = [mask_key(k) for k in manager.available_keys]
+        temp_disabled = {mask_key(k): v.isoformat() for k, v in manager.temporarily_disabled_keys.items()}
+        perm_disabled = [mask_key(k) for k in manager.permanently_disabled_keys]
+
+    return {
+        "available_keys": available,
+        "temporarily_disabled_keys": temp_disabled,
+        "permanently_disabled_keys": perm_disabled,
+        "summary": {
+            "total": len(manager.initial_keys),
+            "available": len(available),
+            "temporarily_disabled": len(temp_disabled),
+            "permanently_disabled": len(perm_disabled)
+        }
+    }
+
 @app.get("/health")
 async def health_check():
     try:
@@ -1253,55 +1374,70 @@ async def health_check():
 @app.get("/test-connection")
 async def test_connection():
     """Test API connectivity to Gemini"""
-    try:
-        # Simple test request to verify API connectivity
-        test_response = await litellm.acompletion(
-            model="gemini/gemini-1.5-flash-latest",
-            messages=[{"role": "user", "content": "Hello"}],
-            max_tokens=5,
-            api_key= await config.api_key_manager.get_next_key()
-        )
+    total_keys = len(config.api_key_manager.initial_keys)
+    last_exception = None
+    
+    for attempt in range(total_keys):
+        current_key = await config.api_key_manager.get_next_key()
+        if not current_key:
+            logger.error("All API keys disabled, cannot perform connection test.")
+            break # Exit loop if no keys are available
+
+        logger.debug(f"Connection test attempt {attempt + 1}/{total_keys} with key '...{current_key[-4:]}'")
         
-        return {
-            "status": "success",
-            "message": "Successfully connected to Gemini API",
-            "model_used": "gemini-1.5-flash-latest",
+        try:
+            # Simple test request to verify API connectivity
+            test_response = await litellm.acompletion(
+                model="gemini/gemini-1.5-flash-latest",
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=5,
+                api_key=current_key
+            )
+            
+            return {
+                "status": "success",
+                "message": f"Successfully connected to Gemini API with key '...{current_key[-4:]}'",
+                "model_used": "gemini-1.5-flash-latest",
+                "timestamp": datetime.now().isoformat(),
+                "response_id": getattr(test_response, 'id', 'unknown')
+            }
+            
+        except litellm.exceptions.AuthenticationError as e:
+            logger.error(f"AuthenticationError on connection test for key '...{current_key[-4:]}'. Deactivating permanently.")
+            await config.api_key_manager.deactivate_permanently(current_key)
+            last_exception = e
+            continue # Try next key
+            
+        except litellm.exceptions.RateLimitError as e:
+            logger.warning(f"RateLimitError on connection test for key '...{current_key[-4:]}'. Deactivating temporarily.")
+            await config.api_key_manager.deactivate_temporarily(current_key)
+            last_exception = e
+            continue # Try next key
+            
+        except Exception as e:
+            logger.error(f"Connection test failed for key '...{current_key[-4:]}': {e}")
+            last_exception = e
+            # For other errors, we also move to the next key
+            continue
+
+    # If loop finishes, all keys failed
+    logger.error("API connectivity test failed for all available keys.")
+    error_message = classify_gemini_error(str(last_exception)) if last_exception else "All API keys failed the connection test."
+    
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "failed",
+            "error_type": "API Error" if isinstance(last_exception, litellm.exceptions.APIError) else "Connection Error",
+            "message": error_message,
             "timestamp": datetime.now().isoformat(),
-            "response_id": getattr(test_response, 'id', 'unknown')
+            "suggestions": [
+                "Check that at least one GEMINI_API_KEY is valid and has permissions.",
+                "Verify your API keys have not reached their rate limits.",
+                "Check your internet connection and firewall settings."
+            ]
         }
-        
-    except litellm.exceptions.APIError as e:
-        logger.error(f"API connectivity test failed: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "failed",
-                "error_type": "API Error",
-                "message": classify_gemini_error(str(e)),
-                "timestamp": datetime.now().isoformat(),
-                "suggestions": [
-                    "Check your GEMINI_API_KEY is valid",
-                    "Verify your API key has the necessary permissions",
-                    "Check if you have reached rate limits"
-                ]
-            }
-        )
-    except Exception as e:
-        logger.error(f"Connection test failed: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "failed",
-                "error_type": "Connection Error", 
-                "message": classify_gemini_error(str(e)),
-                "timestamp": datetime.now().isoformat(),
-                "suggestions": [
-                    "Check your internet connection",
-                    "Verify firewall settings allow HTTPS traffic",
-                    "Try again in a few moments"
-                ]
-            }
-        )
+    )
 
 @app.get("/")
 async def root():
@@ -1322,7 +1458,8 @@ async def root():
         },
         "endpoints": {
             "messages": "/v1/messages",
-            "count_tokens": "/v1/messages/count_tokens", 
+            "count_tokens": "/v1/messages/count_tokens",
+            "key_status": "/v1/keys/status",
             "health": "/health",
             "test_connection": "/test-connection"
         }
@@ -1370,21 +1507,20 @@ def validate_startup():
     """Validate configuration and connectivity on startup"""
     print("🔍 Validating startup configuration...")
     
-    # Check API key
-    if not config.gemini_api_key:
-        print("🔴 FATAL: GEMINI_API_KEY is not set")
+    # CRITICAL: Check for available API keys first
+    if not config.api_key_manager.available_keys:
+        print("🔴 FATAL: No valid GEMINI_API_KEYs were found in the environment. The application cannot start.")
         return False
-    
-    if not config.validate_api_key():
-        print("⚠️ WARNING: API key format validation failed")
-    
+        
+    print(f"✅ Found {len(config.api_key_manager.available_keys)} API key(s).")
+
     # Check network connectivity (basic)
     try:
         import socket
         socket.create_connection(("8.8.8.8", 53), timeout=10)
         print("✅ Network connectivity: OK")
     except OSError:
-        print("⚠️ WARNING: Network connectivity check failed")
+        print("⚠️ WARNING: Network connectivity check failed. The service might not be able to reach Google APIs.")
         
     return True
 
@@ -1406,7 +1542,15 @@ def main():
         print(f"  MAX_TOKENS_LIMIT - Token limit (default: 8192)")
         print(f"  REQUEST_TIMEOUT - Request timeout in seconds (default: 60)")
         print(f"  MAX_RETRIES - Maximum retries (default: 2)")
-        print(f"  MAX_STREAMING_RETRIES - Maximum streaming retries (default: 2)")
+        print("  KEY_COOLDOWN_MINUTES - Cooldown period for temporarily disabled keys in minutes (default: 1440)")
+        print(f"  MAX_STREAMING_RETRIES - Maximum streaming retries (default: 12)")
+        print("")
+        print("Available endpoints:")
+        print("  /v1/messages - Main endpoint for sending messages")
+        print("  /v1/messages/count_tokens - Endpoint for counting tokens")
+        print("  /v1/keys/status - View the real-time status of API keys")
+        print("  /health - Health check for the service")
+        print("  /test-connection - Test connectivity to the Gemini API")
         print(f"  FORCE_DISABLE_STREAMING - Force disable streaming (default: false)")
         print(f"  EMERGENCY_DISABLE_STREAMING - Emergency disable streaming (default: false)")
         print("")
@@ -1429,6 +1573,7 @@ def main():
     print(f"   Max Tokens Limit: {config.max_tokens_limit}")
     print(f"   Request Timeout: {config.request_timeout}s")
     print(f"   Max Retries: {config.max_retries}")
+    print(f"   Key Cooldown: {config.key_cooldown_minutes} minutes")
     print(f"   Max Streaming Retries: {config.max_streaming_retries}")
     print(f"   Force Disable Streaming: {config.force_disable_streaming}")
     print(f"   Emergency Disable Streaming: {config.emergency_disable_streaming}")
