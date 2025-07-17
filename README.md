@@ -1,245 +1,136 @@
-# FOR OFFICIAL GOOGLE AI CLI TOOL SEE https://github.com/google-gemini/gemini-cli
+[中文](https://github.com/wbxs2077/gemini-for-claude-code/blob/main/README_CN.md) | [English](https://github.com/wbxs2077/gemini-for-claude-code/blob/main/README.md)
 
-# Gemini for Claude Code: An Anthropic-Compatible Proxy
+# Gemini API Resilient & Intelligent Gateway
 
-This server acts as a bridge, enabling you to use **Claude Code** with Google's powerful **Gemini models**. It translates API requests and responses between the Anthropic format (used by Claude Code) and the Gemini format (via LiteLLM), allowing seamless integration.
+This project provides a robust, production-ready gateway to interact with the Google Gemini API. It's designed to offer high availability and resilience by intelligently managing multiple API keys, handling failures gracefully, and providing real-time observability.
 
-![Claude Code with Gemini Proxy](image.png)
+## Core Features
 
-## Features
+- **Automatic Failover & Rotation**: Automatically switches to a healthy API key when the current one fails due to rate limits or other errors.
+- **Stateful Key Management**: Intelligently disables keys based on the type of error:
+    - **Temporary Deactivation**: Keys hitting rate limits are temporarily disabled for a configurable duration (defaulting to 24 hours).
+    - **Permanent Deactivation**: Invalid or revoked keys are permanently removed from the pool.
+- **Real-time Status Monitoring**: A dedicated `/v1/keys/status` endpoint provides a live view of the health of all managed API keys, with sensitive parts of the keys masked for security.
+- **Distinct Handling Logic**: Implements separate, optimized strategies for:
+    - **Non-Streaming Requests**: Retries a request across all available keys to maximize success probability.
+    - **Streaming Requests**: Fails fast on a single key to ensure low latency and lets the client decide whether to retry.
+- **Configuration via Environment Variables**: All settings are managed through a `.env` file, following the Twelve-Factor App methodology.
 
-- **Claude Code Compatibility with Gemini**: Directly use the Claude Code CLI with Google Gemini models.
-- **Seamless Model Mapping**: Intelligently maps Claude Code model requests (e.g., `haiku`, `sonnet`, `opus` aliases) to your chosen Gemini models.
-- **LiteLLM Integration**: Leverages LiteLLM for robust and flexible interaction with the Gemini API.
-- **Enhanced Streaming Support**: Handles streaming responses from Gemini with robust error recovery for malformed chunks and API errors.
-- **Complete Tool Use for Claude Code**: Translates Claude Code's tool usage (function calling) to and from Gemini's format, with robust handling of tool results.
-- **Advanced Error Handling**: Provides specific and actionable error messages for common Gemini API issues with automatic fallback strategies.
-- **Resilient Architecture**: Gracefully handles Gemini API instability with smart retry logic and fallback to non-streaming modes.
-- **Diagnostic Endpoints**: Includes `/health` and `/test-connection` for easier troubleshooting of your setup.
-- **Token Counting**: Offers a `/v1/messages/count_tokens` endpoint compatible with Claude Code.
+## How It Works
 
-## Recent Improvements (v2.5.0)
+The gateway sits between your client applications and the Gemini API. Its core intelligence resides in the `ApiKeyManager` class, which maintains the state of all provided API keys.
 
-### 🛡️ Enhanced Error Resilience
-- **Malformed Chunk Recovery**: Automatically detects and handles malformed JSON chunks from Gemini streaming
-- **Smart Retry Logic**: Exponential backoff with configurable retry limits for streaming errors
-- **Graceful Fallback**: Seamlessly switches to non-streaming mode when streaming fails
-- **Buffer Management**: Intelligent chunk buffering and reconstruction for incomplete JSON
-- **Connection Stability**: Handles Gemini 500 Internal Server Errors with automatic retry
+1.  **Request Reception**: The gateway receives a request at `/v1/messages`.
+2.  **Logic Fork**: It checks if the request is for `streaming`.
+    -   **Non-Streaming Path**: The gateway attempts the request in a loop, trying each available key one by one. If a key fails due to a rate limit or invalidity, the `ApiKeyManager` updates its state, and the loop continues with the next key. It returns a successful response from the first key that works, or a `503 Service Unavailable` error if all keys fail.
+    -   **Streaming Path**: The gateway picks one available key and initiates the stream. It's designed to fail fast if this key encounters an error, allowing the client to quickly receive the error and decide on its own retry strategy.
+3.  **State Management**: The `ApiKeyManager` is the brain. It moves keys between `available`, `temporarily_disabled`, and `permanently_disabled` pools based on real-time API feedback, ensuring that only healthy keys are in rotation.
 
-### 📊 Improved Monitoring
-- **Detailed Error Classification**: Specific guidance for different types of Gemini API errors
-- **Enhanced Logging**: Comprehensive error tracking with malformed chunk statistics
-- **Real-time Status**: Better health checks and connection testing
+## Getting Started
 
-## Prerequisites
+### 1. Prerequisites
+- Python 3.8+
 
-- A Google Gemini API key.
-- Python 3.8+.
-- Claude Code CLI installed (e.g., `npm install -g @anthropic-ai/claude-code`).
+### 2. Setup
 
-## Setup
-
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/coffeegrind123/gemini-code.git # Or your fork
-    cd gemini-code
-    ```
-
-2.  **Create and activate a virtual environment** (recommended):
-    ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate
-    ```
-
-3.  **Install dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-4.  **Configure Environment Variables**:
-    Copy the example environment file:
-    ```bash
-    cp .env.example .env
-    ```
-    Edit `.env` and add your Gemini API key. You can also customize model mappings and server settings:
-    ```dotenv
-    # Required: Your Google AI Studio API key. You can provide multiple keys separated by commas for key rotation.
-    GEMINI_API_KEY="your-google-ai-studio-key-1,your-google-ai-studio-key-2"
-
-    # Optional: Model mappings for Claude Code aliases
-    BIG_MODEL="gemini-1.5-pro-latest"    # For 'sonnet' or 'opus' requests
-    SMALL_MODEL="gemini-1.5-flash-latest" # For 'haiku' requests
-    
-    # Optional: Server settings
-    HOST="0.0.0.0"
-    PORT="8082"
-    LOG_LEVEL="WARNING"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-    
-    # Optional: Performance and reliability settings
-    MAX_TOKENS_LIMIT="8192"           # Max tokens for Gemini responses
-    REQUEST_TIMEOUT="90"              # Request timeout in seconds
-    MAX_RETRIES="2"                   # LiteLLM retries to Gemini
-    MAX_STREAMING_RETRIES="12"         # Streaming-specific retry attempts
-    
-    # Optional: Streaming control (use if experiencing issues)
-    FORCE_DISABLE_STREAMING="false"     # Disable streaming globally
-    EMERGENCY_DISABLE_STREAMING="false" # Emergency streaming disable
-    ```
-
-5.  **Run the server**:
-    The `server.py` script includes a `main()` function that starts the Uvicorn server:
-    ```bash
-    python server.py
-    ```
-    For development with auto-reload (restarts when you save changes to `server.py`):
-    ```bash
-    uvicorn server:app --host 0.0.0.0 --port 8082 --reload
-    ```
-    You can view all startup options, including configurable environment variables, by running:
-    ```bash
-    python server.py --help
-    ```
-
-## Usage with Claude Code
-
-1.  **Start the Proxy Server**: Ensure the Gemini proxy server (this application) is running (see step 5 above).
-
-2.  **Configure Claude Code to Use the Proxy**:
-    Set the `ANTHROPIC_BASE_URL` environment variable when running Claude Code:
-    ```bash
-    ANTHROPIC_BASE_URL=http://localhost:8082 claude
-    ```
-    Replace `localhost:8082` if your proxy is running on a different host or port.
-
-3.  **Utilize `CLAUDE.md` for Optimal Gemini Performance (Crucial)**:
-    - This repository includes a `CLAUDE.md` file. This file contains specific instructions and best practices tailored to help **Gemini** effectively understand and respond to **Claude Code's** unique command structure, tool usage patterns, and desired output formats.
-    - **Copy `CLAUDE.md` into your project directory**:
-      ```bash
-      cp /path/to/gemini-code/CLAUDE.md /your/project/directory/
-      ```
-    - When starting a new conversation with Claude Code in that directory, begin with:
-      ```
-      First read and process CLAUDE.md with intent. After understanding and agreeing to use the policies and practices outlined in the document, respond with YES
-      ```
-    - This ensures Gemini receives important context and instructions for better assistance.
-  
-    - If Gemini still fucks up, ask it to read CLAUDE.md again. This might or might not help!
-
-## How It Works: Powering Claude Code with Gemini
-
-1.  **Claude Code Request**: You issue a command or prompt in the Claude Code CLI.
-2.  **Anthropic Format**: Claude Code sends an API request (in Anthropic's Messages API format) to the proxy server's address (`http://localhost:8082`).
-3.  **Proxy Translation (Anthropic to Gemini)**: The proxy server:
-    *   Receives the Anthropic-formatted request.
-    *   Validates it and maps any Claude model aliases (like `claude-3-sonnet...`) to the corresponding Gemini model specified in your `.env` (e.g., `gemini-1.5-pro-latest`).
-    *   Translates the message structure, content blocks, and tool definitions into a format LiteLLM can use with the Gemini API.
-4.  **LiteLLM to Gemini**: LiteLLM sends the prepared request to the target Gemini model using your `GEMINI_API_KEY`.
-5.  **Gemini Response**: Gemini processes the request and sends its response back through LiteLLM.
-6.  **Proxy Translation (Gemini to Anthropic)**: The proxy server:
-    *   Receives the Gemini response from LiteLLM (this can be a stream of events or a complete JSON object).
-    *   Handles streaming errors and malformed chunks with intelligent recovery.
-    *   Converts Gemini's output (text, tool calls, stop reasons) back into the Anthropic Messages API format that Claude Code expects.
-7.  **Response to Claude Code**: The proxy sends the Anthropic-formatted response back to your Claude Code client, which then displays the result or performs the requested action.
-
-## Model Mapping for Claude Code
-
-To ensure Claude Code's model requests are handled correctly by Gemini:
-
-- Requests from Claude Code for model names containing **"haiku"** (e.g., `claude-3-haiku-20240307`) are mapped to the Gemini model specified by your `SMALL_MODEL` environment variable (default: `gemini-1.5-flash-latest`).
-- Requests from Claude Code for model names containing **"sonnet"** or **"opus"** (e.g., `claude-3-sonnet-20240229`, `claude-3-opus-20240229`) are mapped to the Gemini model specified by your `BIG_MODEL` environment variable (default: `gemini-1.5-pro-latest`).
-- If Claude Code requests a full Gemini model name (e.g., `gemini/gemini-1.5-pro-latest`), the proxy will use that directly.
-
-The server maintains a list of known Gemini models. If a recognized Gemini model is requested by the client without the `gemini/` prefix, the proxy will add it.
-
-## Endpoints
-
-- `POST /v1/messages`: The primary endpoint for Claude Code to send messages to Gemini. It's fully compatible with the Anthropic Messages API specification that Claude Code uses.
-- `POST /v1/messages/count_tokens`: Allows Claude Code to estimate the token count for a set of messages, using Gemini's tokenization.
-- `GET /health`: Returns the health status of the proxy, including API key configuration, streaming settings, and basic API key validation.
-- `GET /test-connection`: Performs a quick API call to Gemini to verify connectivity and that your `GEMINI_API_KEY` is working.
-- `GET /`: Root endpoint providing a welcome message, current configuration summary (models, limits), and available endpoints.
-
-## Error Handling & Troubleshooting
-
-### Common Issues and Solutions
-
-**Streaming Errors (malformed chunks):**
-- The proxy automatically handles malformed JSON chunks from Gemini
-- If streaming becomes unstable, set `FORCE_DISABLE_STREAMING=true` as a temporary fix
-- Increase `MAX_STREAMING_RETRIES` for more resilient streaming
-
-**Gemini 500 Internal Server Errors:**
-- The proxy automatically retries with exponential backoff
-- These are temporary Gemini API issues that resolve automatically
-- Check `/health` endpoint to monitor API status
-
-**Connection Timeouts:**
-- Increase `REQUEST_TIMEOUT` if experiencing frequent timeouts
-- Check your internet connection and firewall settings
-- Use `/test-connection` endpoint to verify API connectivity
-
-**Rate Limiting:**
-- Monitor your Google AI Studio quota in the Google Cloud Console
-- The proxy will provide specific rate limit guidance in error messages
-
-### Emergency Mode
-
-If you experience persistent issues:
+**Clone the repository:**
 ```bash
-# Disable streaming temporarily
-export EMERGENCY_DISABLE_STREAMING=true
-
-# Or force disable all streaming
-export FORCE_DISABLE_STREAMING=true
+git clone <repository_url>
+cd gemini-for-claude-code
 ```
 
-## Logging
+**Create a virtual environment:**
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+```
 
-The server provides detailed logs, which are especially useful for understanding how Claude Code requests are translated for Gemini and for monitoring error recovery. Logs are colorized in TTY environments for easier reading. Adjust verbosity with the `LOG_LEVEL` environment variable:
+**Install dependencies:**
+```bash
+pip install -r requirements.txt
+```
 
-- `DEBUG`: Detailed request/response logging and error recovery steps
-- `INFO`: General operation logging
-- `WARNING`: Error recovery and fallback notifications (recommended)
-- `ERROR`: Only errors and failures
-- `CRITICAL`: Only critical failures
+**Configure your environment:**
+Create a `.env` file in the root of the project and add your configuration. You can copy the example file (`.env.example`) to get started.
 
-## The `CLAUDE.MD` File: Guiding Gemini for Claude Code
+```env
+# Your Gemini API Keys, comma-separated. At least two are recommended for failover.
+GEMINI_API_KEY=your_gemini_api_key_1,your_gemini_api_key_2
 
-The `CLAUDE.MD` file included in this repository is critical for achieving the best experience when using this proxy with Claude Code and Gemini.
+# Optional: The duration in minutes to temporarily disable a key after it hits a rate limit.
+KEY_COOLDOWN_MINUTES=1440 # 24 hours
 
-**Purpose:**
+# Optional: Set the logging level. Options are: "DEBUG", "INFO", "WARNING", "ERROR".
+LOG_LEVEL="INFO"
+```
 
-- **Tailors Gemini to Claude Code's Needs**: Claude Code has specific ways it expects an LLM to behave, especially regarding tool use, file operations, and output formatting. `CLAUDE.MD` provides Gemini with explicit instructions on these expectations.
-- **Improves Tool Reliability**: By outlining how tools should be called and results interpreted, it helps Gemini make more effective use of Claude Code's capabilities.
-- **Enhances Code Generation & Understanding**: Gives Gemini context about the development environment and coding standards, leading to better code suggestions within Claude Code.
-- **Reduces Misinterpretations**: Helps bridge any gaps between how Anthropic models might interpret Claude Code directives versus how Gemini might.
+### 3. Running the Server
 
-**How Claude Code Uses It:**
+Start the application with Uvicorn:
+```bash
+uvicorn server:app --host 0.0.0.0 --port 8082
+```
+The server will now be running on `http://localhost:8082`.
 
-When you run `claude` in a project directory, the Claude Code CLI automatically looks for a `CLAUDE.MD` file in that directory. If found, its contents are prepended to the system prompt for every request sent to the LLM (in this case, your Gemini proxy).
+## API Usage
 
-**Recommendation:** Always copy the `CLAUDE.MD` from this proxy's repository into the root of any project where you intend to use Claude Code with this Gemini proxy. This ensures Gemini receives these vital instructions for every session.
+### Send a Message
 
-## Performance Tips
+- **Endpoint**: `POST /v1/messages`
+- **Description**: Forwards a request to the Gemini API using an available key. This endpoint is compatible with the OpenAI/Anthropic Messages API format.
 
-- **Model Selection**: Use `gemini-1.5-flash-latest` for faster responses, `gemini-1.5-pro-latest` for more complex tasks
-- **Streaming**: Keep streaming enabled for better interactivity; the proxy handles errors automatically
-- **Timeouts**: Increase `REQUEST_TIMEOUT` for complex requests that need more processing time
-- **Retries**: Adjust `MAX_STREAMING_RETRIES` based on your network stability
+**Example cURL (Non-Streaming):**
+```bash
+curl -X POST http://localhost:8082/v1/messages \
+-H "Content-Type: application/json" \
+-d '{
+    "model": "gemini-1.5-pro-latest",
+    "messages": [{"role": "user", "content": "Hello, what is the weather like today?"}],
+    "stream": false
+}'
+```
 
-## Contributing
+### Get Key Status
 
-Contributions, issues, and feature requests are welcome! Please submit them on the GitHub repository.
+- **Endpoint**: `GET /v1/keys/status`
+- **Description**: Retrieves the real-time status of all API keys managed by the gateway.
 
-Areas where contributions are especially valuable:
-- Additional Gemini model support
-- Performance optimizations
-- Enhanced error recovery strategies
-- Documentation improvements
+**Example cURL:**
+```bash
+curl http://localhost:8082/v1/keys/status
+```
 
-## Thanks
+**Example Response:**
+```json
+{
+  "available_keys": [
+    "AIzaSy...o_rA"
+  ],
+  "temporarily_disabled_keys": {
+    "AIzaSy...t_bM": "2023-10-27T10:30:00Z"
+  },
+  "permanently_disabled_keys": [
+    "AIzaSy...x_pQ"
+  ],
+  "summary": {
+    "total": 3,
+    "available": 1,
+    "temporarily_disabled": 1,
+    "permanently_disabled": 1
+  }
+}
+```
 
-This project was heavily inspired by and builds upon the foundational work of the [claude-code-proxy by @1rgs](https://github.com/1rgs/claude-code-proxy). Their original proxy was instrumental in demonstrating the viability of such a bridge.
+## Architectural Limitations & Future Work
 
-Special thanks to the community for testing and feedback on error handling improvements.
+- **Island of State**: The current implementation holds the `ApiKeyManager` state in memory for each running process. This presents two challenges:
+    1.  **State is lost on restart.**
+    2.  **It prevents horizontal scaling** (running multiple workers or nodes), as each process would have its own independent state.
+    -   **Solution**: For a true production-grade deployment, the state should be externalized to a shared store like **Redis**.
+
+- **Missing Authentication**: The gateway endpoints are currently unsecured.
+    - **Solution**: A production deployment should implement an authentication layer (e.g., requiring an `X-API-Key` header) to protect the gateway from unauthorized access.
+
+## License
+
+This project is licensed under the MIT License.
