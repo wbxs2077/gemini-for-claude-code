@@ -63,12 +63,29 @@ class ApiKeyManager:
     and permanent removal to handle rate limits and invalid keys gracefully.
     """
     def __init__(self):
-        self.initial_keys: Set[str] = {key.strip() for key in os.environ.get("GEMINI_API_KEY", "").split(',') if key.strip()}
-        if not self.initial_keys:
-            # Fallback for single, potentially empty key
-            single_key = os.environ.get("GEMINI_API_KEY")
-            if single_key:
-                self.initial_keys = {single_key.strip()}
+        # Manually read .env file to bypass python-dotenv library issues.
+        # This is a robust way to ensure comma-separated keys are always parsed correctly.
+        env_file_path = os.path.join(os.path.dirname(__file__), '.env')
+        keys_from_file = ""
+        try:
+            with open(env_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip().startswith('GEMINI_API_KEY='):
+                        keys_from_file = line.strip().split('=', 1)[1]
+                        break
+            
+            # Remove potential surrounding quotes
+            if keys_from_file.startswith('"') and keys_from_file.endswith('"'):
+                keys_from_file = keys_from_file[1:-1]
+            if keys_from_file.startswith("'") and keys_from_file.endswith("'"):
+                keys_from_file = keys_from_file[1:-1]
+
+            self.initial_keys: Set[str] = {key.strip() for key in keys_from_file.split(',') if key.strip()}
+        
+        except (FileNotFoundError, IndexError) as e:
+            # Fallback to os.environ if .env reading fails
+            logger.warning(f"Could not read keys from .env file ({e}), falling back to OS environment variable.")
+            self.initial_keys: Set[str] = {key.strip() for key in os.environ.get("GEMINI_API_KEY", "").split(',') if key.strip()}
 
         self.available_keys: List[str] = sorted(list(self.initial_keys))
         self.temporarily_disabled_keys: Dict[str, datetime] = {}
@@ -78,7 +95,7 @@ class ApiKeyManager:
         self.lock = asyncio.Lock()
         
         if not self.available_keys:
-            logger.error("🚨 No valid GEMINI_API_KEY found in environment variables. The application will not function.")
+            logger.error("🚨 No valid GEMINI_API_KEY found. The application will not function.")
 
     def _rebuild_iterator(self):
         """Rebuilds the key iterator from the current available keys."""
